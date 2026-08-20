@@ -197,10 +197,12 @@ to `javamifi_worktree_baseline` directly.
 ./javamifi-localhost status <stack-id>
 ./javamifi-localhost logs <stack-id> [service]
 ./javamifi-localhost down <stack-id>
+./javamifi-localhost down -all
 ```
 
 Stopping an application stack does not stop PostgreSQL or drop its worktree
-databases. Quick Tunnel URLs are public, temporary, limited to 200 concurrent
+databases. Use `down -all` to stop every application stack managed by this
+checkout. Quick Tunnel URLs are public, temporary, limited to 200 concurrent
 requests, do not support SSE, and are for development only.
 
 Running `up` again recreates Quick Tunnels, so use the newly printed URLs. Local

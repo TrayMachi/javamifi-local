@@ -28,6 +28,7 @@ Usage:
   javamifi-localhost status [STACK_ID]
   javamifi-localhost logs STACK_ID [SERVICE]
   javamifi-localhost down STACK_ID
+  javamifi-localhost down -all
 
 Run `up` inside a JavaMifi checkout to select it automatically. A frontend or
 CMS stack always includes the matching backend worktree when one exists, or the
@@ -204,6 +205,13 @@ show_stack() {
   local state_dir="$1"
   [[ -f "$state_dir/summary.env" ]] || fail "Unknown stack: $(basename "$state_dir")"
   awk -F= '{ printf "%-18s %s\n", $1 ":", substr($0, index($0, "=") + 1) }' "$state_dir/summary.env"
+}
+
+stop_stack() {
+  local state_dir="$1"
+  STACK_ID="$(basename -- "$state_dir")"
+  compose_for "$state_dir" --profile fe --profile cms down --remove-orphans
+  printf 'Stopped stack %s. Its isolated database and generated runtime env remain available.\n' "$STACK_ID"
 }
 
 up_stack() {
@@ -487,11 +495,19 @@ case "$command" in
     ;;
   down)
     [[ $# -eq 1 ]] || fail "down requires STACK_ID."
-    STACK_ID="$1"
-    state_dir="$RUNTIME_ROOT/$STACK_ID"
-    [[ -f "$state_dir/compose.env" ]] || fail "Unknown stack: $STACK_ID"
-    compose_for "$state_dir" --profile fe --profile cms down --remove-orphans
-    printf 'Stopped stack %s. Its isolated database and generated runtime env remain available.\n' "$STACK_ID"
+    if [[ "$1" == "-all" ]]; then
+      if [[ -d "$RUNTIME_ROOT" ]]; then
+        for state_dir in "$RUNTIME_ROOT"/*; do
+          [[ -f "$state_dir/compose.env" ]] || continue
+          stop_stack "$state_dir"
+        done
+      fi
+    else
+      STACK_ID="$1"
+      state_dir="$RUNTIME_ROOT/$STACK_ID"
+      [[ -f "$state_dir/compose.env" ]] || fail "Unknown stack: $STACK_ID"
+      stop_stack "$state_dir"
+    fi
     ;;
   -h|--help|help)
     usage
