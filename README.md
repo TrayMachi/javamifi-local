@@ -80,7 +80,7 @@ may need to be downloaded.
 Run these from `javamifi-local` unless noted otherwise:
 
 ```bash
-# Show running application stacks
+# Show application stacks and live health
 javamifi-localhost status
 
 # Show details for one stack
@@ -95,11 +95,24 @@ javamifi-localhost down <stack-id>
 
 # Stop all application stacks
 javamifi-localhost down -all
+
+# Stop and remove every stack using one worktree
+javamifi-localhost cleanup --path ../javamifi.com-fe-worktrees/feature-example
 ```
 
-Stopping an application stack does not delete its database. Starting the same
-stack again reuses its local ports, but creates new temporary Quick Tunnel
-URLs. Always use the URLs printed by the latest `up` command.
+Status checks the current Compose containers and application URLs. `UP` means
+all configured application endpoints respond, `DEGRADED` means a stack is
+partially running or unreachable, `DOWN` means its application containers are
+stopped, and `UNKNOWN` means Docker Compose could not be queried. Runtime
+metadata and old tunnel URLs remain visible after `down`, but they are not
+treated as proof that the stack is available.
+
+Stopping an application stack removes its containers, network, and
+project-scoped volumes but does not delete its database or generated runtime
+state. Starting the same stack again reuses its local ports, but creates new
+temporary Quick Tunnel URLs. Always use the URLs printed by the latest `up`
+command. Use `cleanup --path` after merging a worktree to remove its runtime
+state as well.
 
 ## Run a worktree
 
