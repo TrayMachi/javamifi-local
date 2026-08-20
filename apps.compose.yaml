@@ -1,0 +1,115 @@
+services:
+  backend:
+    image: node:20-bookworm
+    user: "${HOST_UID}:${HOST_GID}"
+    working_dir: ${BE_PATH}
+    command: npm run dev
+    env_file:
+      - path: ${BE_ENV}
+        format: raw
+    environment:
+      HOME: /tmp
+    volumes:
+      - ${BE_PATH}:${BE_PATH}
+    ports:
+      - "127.0.0.1:${BE_PORT}:3001"
+    networks:
+      - default
+      - database
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3001/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  frontend:
+    image: node:20-bookworm-slim
+    profiles: [fe]
+    user: "${HOST_UID}:${HOST_GID}"
+    working_dir: ${FE_PATH}
+    command: npm run dev -- --port 3000
+    env_file:
+      - path: ${FE_ENV}
+        format: raw
+    environment:
+      HOME: /tmp
+    volumes:
+      - ${FE_PATH}:${FE_PATH}
+    ports:
+      - "127.0.0.1:${FE_PORT}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 15s
+
+  cms:
+    image: node:20-bookworm-slim
+    profiles: [cms]
+    user: "${HOST_UID}:${HOST_GID}"
+    working_dir: ${CMS_PATH}
+    command: npm run dev
+    env_file:
+      - path: ${CMS_ENV}
+        format: raw
+    environment:
+      HOME: /tmp
+    volumes:
+      - ${CMS_PATH}:${CMS_PATH}
+    ports:
+      - "127.0.0.1:${CMS_PORT}:3002"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3002').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 15s
+
+  gateway-fe:
+    image: nginx:1.27-alpine
+    profiles: [fe]
+    volumes:
+      - ${FE_GATEWAY_CONFIG}:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:${FE_GATEWAY_PORT}:8080"
+
+  tunnel-fe:
+    image: cloudflare/cloudflared:latest
+    profiles: [fe]
+    command: tunnel --no-autoupdate --protocol http2 --loglevel info --url http://gateway-fe:8080
+    depends_on:
+      - gateway-fe
+
+  gateway-cms:
+    image: nginx:1.27-alpine
+    profiles: [cms]
+    volumes:
+      - ${CMS_GATEWAY_CONFIG}:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:${CMS_GATEWAY_PORT}:8080"
+
+  tunnel-cms:
+    image: cloudflare/cloudflared:latest
+    profiles: [cms]
+    command: tunnel --no-autoupdate --protocol http2 --loglevel info --url http://gateway-cms:8080
+    depends_on:
+      - gateway-cms
+
+networks:
+  database:
+    external: true
+    name: javamifi-local_default

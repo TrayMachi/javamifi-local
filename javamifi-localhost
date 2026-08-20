@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
+readonly WORKSPACE_DIR="$(dirname -- "$SCRIPT_DIR")"
+readonly COMPOSE_FILE="$SCRIPT_DIR/apps.compose.yaml"
+readonly RUNTIME_ROOT="$SCRIPT_DIR/.runtime"
+readonly FE_MAIN="$WORKSPACE_DIR/javamifi.com-fe"
+readonly BE_MAIN="$WORKSPACE_DIR/javamifi.com-be"
+readonly CMS_MAIN="$WORKSPACE_DIR/cms.javamifi.com"
+readonly TURNSTILE_TEST_SITE_KEY="1x00000000000000000000AA"
+readonly TURNSTILE_TEST_SECRET_KEY="1x0000000000000000000000000000000AA"
+
+fail() {
+  printf 'Localhost command failed: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Required command '$1' is unavailable."
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  javamifi-localhost up [--fe PATH] [--be PATH] [--cms PATH] [--all] [--name NAME]
+  javamifi-localhost status [STACK_ID]
+  javamifi-localhost logs STACK_ID [SERVICE]
+  javamifi-localhost down STACK_ID
+
+Run `up` inside a JavaMifi checkout to select it automatically. A frontend or
+CMS stack always includes the matching backend worktree when one exists, or the
+main backend otherwise. A backend stack includes the matching frontend or main
+frontend. Quick Tunnel URLs are temporary and change after tunnel recreation.
+EOF
+}
+
+require_command curl
+require_command docker
+require_command git
+require_command npm
+require_command readlink
+require_command sha256sum
+require_command ss
+
+canonical_dir() {
+  [[ -d "$1" ]] || fail "Directory does not exist: $1"
+  readlink -f -- "$1"
+}
+
+branch_name() {
+  git -C "$1" branch --show-current 2>/dev/null || true
+}
+
+matching_worktree() {
+  local main="$1"
+  local branch="$2"
+  local path=""
+  local line
+
+  [[ -n "$branch" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) path="${line#worktree }" ;;
+      "branch refs/heads/$branch")
+        printf '%s\n' "$path"
+        return 0
+        ;;
+    esac
+  done < <(git -C "$main" worktree list --porcelain)
+  return 1
+}
+
+copy_baseline_env() {
+  local selected="$1"
+  local main="$2"
+  local destination="$3"
+  local source="$selected/.env"
+
+  if [[ ! -f "$source" ]]; then
+    source="$main/.env"
+  fi
+  [[ -f "$source" ]] || fail "Missing environment baseline: $main/.env"
+  cp "$source" "$destination"
+  chmod 600 "$destination"
+}
+
+env_value() {
+  local file="$1"
+  local key="$2"
+  local line=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$key="* ]] || continue
+    printf '%s' "${line#*=}"
+  done <"$file"
+}
+
+set_env_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local temp
+
+  temp="$(mktemp)"
+  awk -v key="$key" '$0 !~ "^" key "=" { print }' "$file" >"$temp"
+  printf '%s=%s\n' "$key" "$value" >>"$temp"
+  mv "$temp" "$file"
+  chmod 600 "$file"
+}
+
+ensure_dependencies() {
+  local path="$1"
+  if [[ ! -d "$path/node_modules" ]]; then
+    printf 'Installing dependencies in %s...\n' "$path"
+    (cd "$path" && npm ci)
+  fi
+}
+
+port_is_free() {
+  ! ss -H -ltn | awk '{ address=$4; sub(/^.*:/, "", address); print address }' | grep -Fxq "$1"
+}
+
+pick_port() {
+  local minimum="$1"
+  local maximum="$2"
+  local port
+  local attempt
+
+  for attempt in $(seq 1 100); do
+    port="$(shuf -i "$minimum-$maximum" -n 1)"
+    if port_is_free "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  fail "Could not allocate a free port between $minimum and $maximum."
+}
+
+compose_for() {
+  local state_dir="$1"
+  shift
+  docker compose \
+    --project-name "javamifi-${STACK_ID}" \
+    --file "$COMPOSE_FILE" \
+    --env-file "$state_dir/compose.env" \
+    "$@"
+}
+
+wait_for_tunnel() {
+  local state_dir="$1"
+  local service="$2"
+  local url=""
+  local logs=""
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    logs="$(compose_for "$state_dir" logs --no-color "$service" 2>&1 || true)"
+    url="$(printf '%s\n' "$logs" | grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
+    if [[ -n "$url" && "$logs" == *"Registered tunnel connection"* ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+    sleep 1
+  done
+  compose_for "$state_dir" logs --no-color "$service" >&2 || true
+  fail "Timed out waiting for $service to create a Quick Tunnel."
+}
+
+wait_for_url() {
+  local url="$1"
+  local origin="${2:-}"
+  local args=(--fail --silent --show-error --location --retry 45 --retry-delay 2 --retry-all-errors)
+  if [[ -n "$origin" ]]; then
+    args+=(--header "Origin: $origin")
+  fi
+  curl "${args[@]}" "$url" >/dev/null
+}
+
+write_compose_env() {
+  local state_dir="$1"
+  cat >"$state_dir/compose.env" <<EOF
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+BE_PATH=$BE_PATH
+FE_PATH=$FE_PATH
+CMS_PATH=$CMS_PATH
+BE_ENV=$state_dir/backend.env
+FE_ENV=$state_dir/frontend.env
+CMS_ENV=$state_dir/cms.env
+BE_PORT=$BE_PORT
+FE_PORT=$FE_PORT
+CMS_PORT=$CMS_PORT
+FE_GATEWAY_PORT=$FE_GATEWAY_PORT
+CMS_GATEWAY_PORT=$CMS_GATEWAY_PORT
+FE_GATEWAY_CONFIG=$SCRIPT_DIR/nginx/frontend.conf
+CMS_GATEWAY_CONFIG=$SCRIPT_DIR/nginx/cms.conf
+EOF
+  chmod 600 "$state_dir/compose.env"
+}
+
+show_stack() {
+  local state_dir="$1"
+  [[ -f "$state_dir/summary.env" ]] || fail "Unknown stack: $(basename "$state_dir")"
+  awk -F= '{ printf "%-18s %s\n", $1 ":", substr($0, index($0, "=") + 1) }' "$state_dir/summary.env"
+}
+
+up_stack() {
+  local custom_name=""
+  local explicit_selection=false
+  local include_fe=false
+  local include_cms=false
+  local current_root=""
+  local current_repo=""
+  local common_dir=""
+  local selected_branch=""
+  local match=""
+  local stack_seed
+  local stack_hash
+  local stack_label
+  local state_dir
+  local database_url
+  local original_origins
+  local allowed_origins
+  local frontend_url=""
+  local cms_url=""
+  local profiles=()
+  local app_services=(backend)
+
+  BE_PATH=""
+  FE_PATH=""
+  CMS_PATH=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fe)
+        [[ $# -ge 2 ]] || fail "--fe requires a path."
+        FE_PATH="$(canonical_dir "$2")"
+        include_fe=true
+        explicit_selection=true
+        shift 2
+        ;;
+      --be)
+        [[ $# -ge 2 ]] || fail "--be requires a path."
+        BE_PATH="$(canonical_dir "$2")"
+        explicit_selection=true
+        shift 2
+        ;;
+      --cms)
+        [[ $# -ge 2 ]] || fail "--cms requires a path."
+        CMS_PATH="$(canonical_dir "$2")"
+        include_cms=true
+        explicit_selection=true
+        shift 2
+        ;;
+      --all)
+        FE_PATH="$FE_MAIN"
+        BE_PATH="$BE_MAIN"
+        CMS_PATH="$CMS_MAIN"
+        include_fe=true
+        include_cms=true
+        explicit_selection=true
+        shift
+        ;;
+      --name)
+        [[ $# -ge 2 ]] || fail "--name requires a value."
+        custom_name="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *) fail "Unknown option: $1" ;;
+    esac
+  done
+
+  if [[ "$explicit_selection" == false ]]; then
+    current_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -n "$current_root" ]]; then
+      common_dir="$(git -C "$current_root" rev-parse --path-format=absolute --git-common-dir)"
+      current_repo="$(basename "$(dirname "$common_dir")")"
+    else
+      current_repo="$(basename "$SCRIPT_DIR")"
+    fi
+    case "$current_repo" in
+      javamifi.com-fe)
+        FE_PATH="$current_root"
+        include_fe=true
+        ;;
+      cms.javamifi.com)
+        CMS_PATH="$current_root"
+        include_cms=true
+        ;;
+      javamifi.com-be)
+        BE_PATH="$current_root"
+        ;;
+    esac
+  fi
+
+  if [[ -z "$FE_PATH" && -z "$CMS_PATH" && -z "$BE_PATH" ]]; then
+    FE_PATH="$FE_MAIN"
+    BE_PATH="$BE_MAIN"
+    CMS_PATH="$CMS_MAIN"
+    include_fe=true
+    include_cms=true
+  fi
+
+  if [[ -z "$BE_PATH" ]]; then
+    if [[ -n "$FE_PATH" ]]; then
+      selected_branch="$(branch_name "$FE_PATH")"
+    else
+      selected_branch="$(branch_name "$CMS_PATH")"
+    fi
+    match="$(matching_worktree "$BE_MAIN" "$selected_branch" || true)"
+    BE_PATH="${match:-$BE_MAIN}"
+  fi
+
+  if [[ "$include_fe" == false && "$include_cms" == false ]]; then
+    selected_branch="$(branch_name "$BE_PATH")"
+    match="$(matching_worktree "$FE_MAIN" "$selected_branch" || true)"
+    FE_PATH="${match:-$FE_MAIN}"
+    include_fe=true
+  fi
+
+  FE_PATH="${FE_PATH:-$FE_MAIN}"
+  CMS_PATH="${CMS_PATH:-$CMS_MAIN}"
+  BE_PATH="$(canonical_dir "$BE_PATH")"
+  FE_PATH="$(canonical_dir "$FE_PATH")"
+  CMS_PATH="$(canonical_dir "$CMS_PATH")"
+
+  [[ -f "$BE_PATH/package.json" && -f "$BE_PATH/prisma/schema.prisma" ]] || fail "Invalid backend checkout: $BE_PATH"
+  if [[ "$include_fe" == true ]]; then
+    [[ -f "$FE_PATH/package.json" ]] || fail "Invalid frontend checkout: $FE_PATH"
+  fi
+  if [[ "$include_cms" == true ]]; then
+    [[ -f "$CMS_PATH/package.json" ]] || fail "Invalid CMS checkout: $CMS_PATH"
+  fi
+
+  ensure_dependencies "$BE_PATH"
+  if [[ ! -f "$BE_PATH/.env" ]]; then
+    (cd "$BE_PATH" && "$SCRIPT_DIR/javamifi-db" setup)
+  fi
+  (cd "$BE_PATH" && "$SCRIPT_DIR/javamifi-db" ensure)
+  ensure_dependencies "$FE_PATH"
+  if [[ "$include_cms" == true ]]; then
+    ensure_dependencies "$CMS_PATH"
+  fi
+  if [[ ! -d "$BE_PATH/generated/prisma" ]]; then
+    (cd "$BE_PATH" && npm exec -- prisma generate)
+  fi
+
+  docker compose --project-name javamifi-local --file "$SCRIPT_DIR/compose.yaml" up -d --wait postgres
+
+  stack_seed="$BE_PATH|$include_fe:$FE_PATH|$include_cms:$CMS_PATH"
+  stack_hash="$(printf '%s' "$stack_seed" | sha256sum | cut -c1-10)"
+  stack_label="${custom_name:-$(branch_name "$BE_PATH")-${stack_hash}}"
+  stack_label="$(printf '%s' "$stack_label" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-40)"
+  [[ -n "$stack_label" ]] || stack_label="stack-$stack_hash"
+  STACK_ID="${stack_label}-${stack_hash}"
+  state_dir="$RUNTIME_ROOT/$STACK_ID"
+  mkdir -p "$state_dir"
+  chmod 700 "$RUNTIME_ROOT" "$state_dir"
+
+  if [[ -f "$state_dir/compose.env" ]]; then
+    BE_PORT="$(env_value "$state_dir/compose.env" BE_PORT)"
+    FE_PORT="$(env_value "$state_dir/compose.env" FE_PORT)"
+    CMS_PORT="$(env_value "$state_dir/compose.env" CMS_PORT)"
+    FE_GATEWAY_PORT="$(env_value "$state_dir/compose.env" FE_GATEWAY_PORT)"
+    CMS_GATEWAY_PORT="$(env_value "$state_dir/compose.env" CMS_GATEWAY_PORT)"
+  else
+    BE_PORT="$(pick_port 31000 31999)"
+    FE_PORT="$(pick_port 32000 32999)"
+    CMS_PORT="$(pick_port 33000 33999)"
+    FE_GATEWAY_PORT="$(pick_port 34000 34999)"
+    CMS_GATEWAY_PORT="$(pick_port 35000 35999)"
+  fi
+
+  copy_baseline_env "$BE_PATH" "$BE_MAIN" "$state_dir/backend.env"
+  copy_baseline_env "$FE_PATH" "$FE_MAIN" "$state_dir/frontend.env"
+  copy_baseline_env "$CMS_PATH" "$CMS_MAIN" "$state_dir/cms.env"
+
+  database_url="$(cd "$BE_PATH" && "$SCRIPT_DIR/javamifi-db" url)"
+  database_url="${database_url/@127.0.0.1:5432/@postgres:5432}"
+  database_url="${database_url/@localhost:5432/@postgres:5432}"
+  set_env_value "$state_dir/backend.env" DATABASE_URL "$database_url"
+  set_env_value "$state_dir/backend.env" PORT 3001
+  set_env_value "$state_dir/backend.env" NODE_ENV development
+  set_env_value "$state_dir/backend.env" CLOUDFLARE_TURNSTILE_SECRET_KEY "$TURNSTILE_TEST_SECRET_KEY"
+
+  write_compose_env "$state_dir"
+
+  if [[ "$include_fe" == true ]]; then
+    profiles+=(--profile fe)
+    app_services+=(frontend)
+    compose_for "$state_dir" --profile fe up -d gateway-fe
+    compose_for "$state_dir" --profile fe up -d --force-recreate tunnel-fe
+  fi
+  if [[ "$include_cms" == true ]]; then
+    profiles+=(--profile cms)
+    app_services+=(cms)
+    compose_for "$state_dir" --profile cms up -d gateway-cms
+    compose_for "$state_dir" --profile cms up -d --force-recreate tunnel-cms
+  fi
+
+  if [[ "$include_fe" == true ]]; then
+    frontend_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"
+    set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_API_URL "$frontend_url/api/v1"
+    set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_SITE_URL "$frontend_url"
+    set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITE_KEY "$TURNSTILE_TEST_SITE_KEY"
+  fi
+  if [[ "$include_cms" == true ]]; then
+    cms_url="$(wait_for_tunnel "$state_dir" tunnel-cms)"
+    set_env_value "$state_dir/cms.env" NEXT_PUBLIC_API_BASE_URL "$cms_url/api/v1"
+    set_env_value "$state_dir/cms.env" NEXT_PUBLIC_ENV development
+  fi
+
+  original_origins="$(env_value "$state_dir/backend.env" ALLOWED_ORIGINS)"
+  original_origins="${original_origins%\"}"
+  original_origins="${original_origins#\"}"
+  allowed_origins="$original_origins"
+  [[ -n "$frontend_url" ]] && allowed_origins="${allowed_origins:+$allowed_origins,}$frontend_url"
+  [[ -n "$cms_url" ]] && allowed_origins="${allowed_origins:+$allowed_origins,}$cms_url"
+  set_env_value "$state_dir/backend.env" ALLOWED_ORIGINS "$allowed_origins"
+  if [[ -n "$frontend_url" ]]; then
+    set_env_value "$state_dir/backend.env" FRONTEND_URL "$frontend_url"
+  fi
+
+  compose_for "$state_dir" "${profiles[@]}" up -d --force-recreate --wait "${app_services[@]}"
+
+  if [[ "$include_fe" == true ]]; then
+    wait_for_url "$frontend_url/api/v1/health" "$frontend_url"
+    wait_for_url "$frontend_url"
+  fi
+  if [[ "$include_cms" == true ]]; then
+    wait_for_url "$cms_url/api/v1/health" "$cms_url"
+    wait_for_url "$cms_url"
+  fi
+
+  cat >"$state_dir/summary.env" <<EOF
+STACK_ID=$STACK_ID
+BACKEND_PATH=$BE_PATH
+BACKEND_LOCAL=http://localhost:$BE_PORT
+FRONTEND_PATH=$([[ "$include_fe" == true ]] && printf '%s' "$FE_PATH")
+FRONTEND_URL=$frontend_url
+CMS_PATH=$([[ "$include_cms" == true ]] && printf '%s' "$CMS_PATH")
+CMS_URL=$cms_url
+EOF
+  chmod 600 "$state_dir/summary.env"
+
+  printf '\nJavaMifi localhost stack is ready.\n'
+  show_stack "$state_dir"
+  printf 'Quick Tunnel URLs are public, temporary, and intended only for development.\n'
+}
+
+command="${1:-up}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  up)
+    up_stack "$@"
+    ;;
+  status)
+    if [[ $# -gt 0 ]]; then
+      STACK_ID="$1"
+      show_stack "$RUNTIME_ROOT/$STACK_ID"
+      compose_for "$RUNTIME_ROOT/$STACK_ID" ps
+    else
+      [[ -d "$RUNTIME_ROOT" ]] || exit 0
+      for state_dir in "$RUNTIME_ROOT"/*; do
+        [[ -f "$state_dir/summary.env" ]] || continue
+        show_stack "$state_dir"
+        printf '\n'
+      done
+    fi
+    ;;
+  logs)
+    [[ $# -ge 1 ]] || fail "logs requires STACK_ID."
+    STACK_ID="$1"
+    state_dir="$RUNTIME_ROOT/$STACK_ID"
+    [[ -f "$state_dir/compose.env" ]] || fail "Unknown stack: $STACK_ID"
+    shift
+    compose_for "$state_dir" logs --no-color "$@"
+    ;;
+  down)
+    [[ $# -eq 1 ]] || fail "down requires STACK_ID."
+    STACK_ID="$1"
+    state_dir="$RUNTIME_ROOT/$STACK_ID"
+    [[ -f "$state_dir/compose.env" ]] || fail "Unknown stack: $STACK_ID"
+    compose_for "$state_dir" --profile fe --profile cms down --remove-orphans
+    printf 'Stopped stack %s. Its isolated database and generated runtime env remain available.\n' "$STACK_ID"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    fail "Unknown command: $command"
+    ;;
+esac

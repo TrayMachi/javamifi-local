@@ -1,0 +1,53 @@
+flowchart TB
+  device[Developer or remote device]
+  cloudflare[Cloudflare Quick Tunnels]
+
+  subgraph main[Main stack: independent Compose project]
+    mainFeGateway[FE same-origin gateway]
+    mainCmsGateway[CMS same-origin gateway]
+    mainFe[Main frontend]
+    mainCms[Main CMS]
+    mainBe[Main backend]
+
+    mainFeGateway -->|all other paths| mainFe
+    mainFeGateway -->|/api/*| mainBe
+    mainCmsGateway -->|all other paths| mainCms
+    mainCmsGateway -->|/api/*| mainBe
+  end
+
+  subgraph worktree[Feature stack: independent Compose project]
+    wtFeGateway[FE same-origin gateway]
+    wtCmsGateway[CMS same-origin gateway]
+    wtFe[Worktree frontend]
+    wtCms[Worktree CMS]
+    wtBe[Matching worktree backend]
+
+    wtFeGateway -->|all other paths| wtFe
+    wtFeGateway -->|/api/*| wtBe
+    wtCmsGateway -->|all other paths| wtCms
+    wtCmsGateway -->|/api/*| wtBe
+  end
+
+  subgraph database[Shared javamifi-local PostgreSQL container]
+    baseline[(Immutable worktree baseline)]
+    mainDb[(Main development database)]
+    wtDb[(Feature development clone)]
+    wtTestDb[(Feature test database)]
+
+    baseline -. clone .-> wtDb
+  end
+
+  device --> cloudflare
+  cloudflare --> mainFeGateway
+  cloudflare --> mainCmsGateway
+  cloudflare --> wtFeGateway
+  cloudflare --> wtCmsGateway
+
+  mainBe --> mainDb
+  wtBe --> wtDb
+  wtBe -. javamifi-db test .-> wtTestDb
+
+  mainRuntime[.runtime/main-*/ generated env and ports] -. configures .-> main
+  wtRuntime[.runtime/feature-*/ generated env and ports] -. configures .-> worktree
+  mainEnv[Main checkout .env files: read-only baselines] -. copied into runtime state .-> mainRuntime
+  mainEnv -. copied into runtime state .-> wtRuntime

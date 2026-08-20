@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly BIN_DIR="${JAVAMIFI_BIN_DIR:-$HOME/.local/bin}"
+
+fail() {
+  printf 'Install failed: %s\n' "$*" >&2
+  exit 1
+}
+
+install_cli() {
+  local name="$1"
+  local source="$SCRIPT_DIR/$name"
+  local destination="$BIN_DIR/$name"
+
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    if [[ "$(readlink -f -- "$destination")" == "$source" ]]; then
+      printf '%s is already installed.\n' "$name"
+      return
+    fi
+    fail "$destination already exists and is not managed by this repository."
+  fi
+
+  ln -s "$source" "$destination"
+  printf 'Installed %s -> %s\n' "$destination" "$source"
+}
+
+command -v readlink >/dev/null 2>&1 || fail "Required command 'readlink' is unavailable."
+mkdir -p "$BIN_DIR"
+
+install_cli javamifi-db
+install_cli javamifi-localhost
+
+if [[ ":${PATH:-}:" != *":$BIN_DIR:"* ]]; then
+  printf '\n%s is not on PATH. Add this line to your shell profile:\n' "$BIN_DIR"
+  printf 'export PATH="%s:$PATH"\n' "$BIN_DIR"
+fi

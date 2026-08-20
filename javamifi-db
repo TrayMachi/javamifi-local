@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+readonly COMPOSE_FILE="$SCRIPT_DIR/compose.yaml"
+readonly COMPOSE_PROJECT="javamifi-local"
+readonly DB_USER="javamifi"
+readonly DB_PASSWORD="javamifi"
+readonly DB_HOST="127.0.0.1"
+readonly DB_PORT="5432"
+readonly BASELINE_DATABASE="javamifi_worktree_baseline"
+
+fail() {
+  printf 'Database command failed: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Required command '$1' is unavailable."
+}
+
+require_command docker
+require_command git
+require_command npm
+require_command readlink
+require_command sha256sum
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Run this command inside a Git worktree."
+[[ -f "$ROOT/prisma/schema.prisma" ]] || fail "This is not a JavaMifi backend worktree: $ROOT"
+
+slug="$(basename "$ROOT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/^_//; s/_$//' | cut -c1-35)"
+[[ -n "$slug" ]] || slug="worktree"
+hash="$(printf '%s' "$ROOT" | sha256sum | cut -c1-8)"
+readonly DATABASE="javamifi_${slug}_${hash}"
+readonly TEST_DATABASE="${DATABASE}_test"
+readonly APP_PORT="$((3000 + 16#${hash:0:6} % 1000))"
+readonly TEST_PORT="$((4000 + 16#${hash:0:6} % 1000))"
+
+compose() {
+  docker compose \
+    --project-name "$COMPOSE_PROJECT" \
+    --file "$COMPOSE_FILE" \
+    "$@"
+}
+
+database_url() {
+  local database="$1"
+  printf 'postgresql://%s:%s@%s:%s/%s?schema=public&connection_limit=5' \
+    "$DB_USER" "$DB_PASSWORD" "$DB_HOST" "$DB_PORT" "$database"
+}
+
+set_env_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local temp
+
+  temp="$(mktemp)"
+  if [[ -f "$file" ]]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { found = 0 }
+      $0 ~ "^" key "=" {
+        if (!found) print key "=" value
+        found = 1
+        next
+      }
+      { print }
+      END { if (!found) print key "=" value }
+    ' "$file" >"$temp"
+  else
+    printf '%s=%s\n' "$key" "$value" >"$temp"
+  fi
+  mv "$temp" "$file"
+}
+
+write_environment() {
+  local common_dir
+  local main_env
+  local test_example="$ROOT/.env.test.example"
+
+  if [[ ! -f "$ROOT/.env" ]]; then
+    common_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
+    main_env="$(dirname "$common_dir")/.env"
+    if [[ "$main_env" != "$ROOT/.env" && -f "$main_env" ]]; then
+      cp "$main_env" "$ROOT/.env"
+    fi
+  fi
+
+  if [[ ! -f "$ROOT/.env.test" && -f "$test_example" ]]; then
+    cp "$test_example" "$ROOT/.env.test"
+  fi
+
+  set_env_value "$ROOT/.env" DATABASE_URL "$(database_url "$DATABASE")"
+  set_env_value "$ROOT/.env" NODE_ENV development
+  set_env_value "$ROOT/.env" PORT "$APP_PORT"
+  set_env_value "$ROOT/.env.test" DATABASE_URL "$(database_url "$TEST_DATABASE")"
+  set_env_value "$ROOT/.env.test" NODE_ENV test
+  set_env_value "$ROOT/.env.test" PORT "$TEST_PORT"
+  set_env_value "$ROOT/.env.test" JWT_SECRET test-jwt-secret
+  set_env_value "$ROOT/.env.test" JWT_REFRESH_SECRET test-jwt-refresh-secret
+  set_env_value "$ROOT/.env.test" JWT_ACCESS_EXPIRES_IN 15m
+  set_env_value "$ROOT/.env.test" JWT_REFRESH_EXPIRES_IN 30d
+  set_env_value "$ROOT/.env.test" API_CENTER_SUBMIT /webhook/v2/submit-order/paid
+}
+
+start_postgres() {
+  printf 'Starting shared PostgreSQL container...\n'
+  compose up -d --wait postgres || fail "Could not start PostgreSQL. Ensure the Docker daemon is running and port $DB_PORT is available."
+}
+
+database_exists() {
+  local database="$1"
+  [[ "$(compose exec -T postgres psql \
+    --username "$DB_USER" \
+    --dbname postgres \
+    --tuples-only \
+    --no-align \
+    --command "SELECT 1 FROM pg_database WHERE datname = '$database'")" == "1" ]]
+}
+
+create_database() {
+  local database="$1"
+  if database_exists "$database"; then
+    printf 'Database %s already exists.\n' "$database"
+    return
+  fi
+
+  compose exec -T postgres createdb --username "$DB_USER" "$database"
+  printf 'Created database %s.\n' "$database"
+}
+
+clone_database() {
+  local database="$1"
+  local source="$2"
+
+  if database_exists "$database"; then
+    printf 'Database %s already exists.\n' "$database"
+    return
+  fi
+
+  database_exists "$source" || fail "Missing database baseline '$source'. Restore a snapshot with 'javamifi-db baseline restore <archive.gz> <snapshot-database>' first."
+  compose exec -T postgres createdb \
+    --username "$DB_USER" \
+    --template "$source" \
+    "$database" || fail "Could not clone '$source'. Ensure no client is connected to the source database."
+  printf 'Cloned database %s from %s.\n' "$database" "$source"
+}
+
+sync_sequences() {
+  local database="$1"
+
+  [[ "$database" =~ ^javamifi_[a-z0-9_]+$ ]] || fail "Refusing to modify unexpected database name: $database"
+  database_exists "$database" || fail "Cannot synchronize sequences for missing database '$database'."
+
+  compose exec -T postgres psql \
+    --username "$DB_USER" \
+    --dbname "$database" \
+    --set ON_ERROR_STOP=1 <<'SQL'
+DO $sequence_sync$
+DECLARE
+  sequence_row record;
+  maximum_value bigint;
+BEGIN
+  FOR sequence_row IN
+    SELECT
+      table_schema,
+      table_name,
+      column_name,
+      COALESCE(
+        pg_get_serial_sequence(
+          format('%I.%I', table_schema, table_name),
+          column_name
+        ),
+        substring(
+          column_default FROM 'nextval\(''([^'']+)''::regclass\)'
+        )
+      ) AS sequence_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND (column_default LIKE 'nextval(%' OR is_identity = 'YES')
+  LOOP
+    CONTINUE WHEN sequence_row.sequence_name IS NULL;
+
+    EXECUTE format(
+      'SELECT MAX(%I) FROM %I.%I',
+      sequence_row.column_name,
+      sequence_row.table_schema,
+      sequence_row.table_name
+    ) INTO maximum_value;
+
+    IF maximum_value IS NULL THEN
+      PERFORM setval(sequence_row.sequence_name::regclass, 1, false);
+    ELSE
+      PERFORM setval(sequence_row.sequence_name::regclass, maximum_value, true);
+    END IF;
+  END LOOP;
+END
+$sequence_sync$;
+SQL
+
+  printf 'Synchronized serial sequences in %s.\n' "$database"
+}
+
+drop_database() {
+  local database="$1"
+  [[ "$database" =~ ^javamifi_[a-z0-9_]+$ ]] || fail "Refusing to drop unexpected database name: $database"
+
+  compose exec -T postgres dropdb \
+    --if-exists \
+    --force \
+    --username "$DB_USER" \
+    "$database"
+  printf 'Dropped database %s.\n' "$database"
+}
+
+run_prisma() {
+  local url="$1"
+  shift
+  (
+    cd "$ROOT"
+    DATABASE_URL="$url" npm exec -- prisma "$@"
+  )
+}
+
+seed_database() {
+  local url="$1"
+  local environment="$2"
+  (
+    cd "$ROOT"
+    DATABASE_URL="$url" NODE_ENV="$environment" npm run seed
+  )
+}
+
+set_baseline() {
+  local source="${1:-}"
+
+  [[ "$source" =~ ^javamifi_staging_[0-9]{8,14}$ ]] ||
+    fail "Expected a local staging snapshot database such as javamifi_staging_20260820."
+
+  start_postgres
+  database_exists "$source" || fail "Source database '$source' does not exist."
+
+  if database_exists "$BASELINE_DATABASE"; then
+    drop_database "$BASELINE_DATABASE"
+  fi
+
+  compose exec -T postgres createdb \
+    --username "$DB_USER" \
+    --template "$source" \
+    "$BASELINE_DATABASE" || fail "Could not clone '$source'. Disconnect clients from it and retry."
+  compose exec -T postgres psql \
+    --username "$DB_USER" \
+    --dbname postgres \
+    --command "COMMENT ON DATABASE $BASELINE_DATABASE IS 'Worktree baseline copied from $source';" \
+    --command "ALTER DATABASE $BASELINE_DATABASE WITH IS_TEMPLATE true ALLOW_CONNECTIONS false;"
+
+  printf 'Installed immutable worktree baseline from %s.\n' "$source"
+}
+
+restore_baseline() {
+  local archive="${1:-}"
+  local source="${2:-}"
+
+  [[ -f "$archive" ]] || fail "Snapshot archive does not exist: ${archive:-<missing>}"
+  [[ "$source" =~ ^javamifi_staging_[0-9]{8,14}$ ]] ||
+    fail "Expected a database name such as javamifi_staging_20260820."
+  require_command gzip
+
+  start_postgres
+  database_exists "$source" && fail "Database '$source' already exists."
+  compose exec -T postgres createdb --username "$DB_USER" "$source"
+
+  printf 'Restoring %s into %s...\n' "$archive" "$source"
+  if ! gzip -dc -- "$archive" | compose exec -T postgres psql \
+    --username "$DB_USER" \
+    --dbname "$source" \
+    --quiet \
+    --set ON_ERROR_STOP=1; then
+    drop_database "$source"
+    fail "Could not restore snapshot archive '$archive'."
+  fi
+
+  set_baseline "$source"
+}
+
+show_baseline_status() {
+  start_postgres
+  database_exists "$BASELINE_DATABASE" || fail "No worktree baseline is installed. Restore a snapshot with 'javamifi-db baseline restore <archive.gz> <snapshot-database>'."
+
+  compose exec -T postgres psql \
+    --username "$DB_USER" \
+    --dbname postgres \
+    --tuples-only \
+    --no-align \
+    --command "SELECT datname || ' | ' || pg_size_pretty(pg_database_size(datname)) || ' | ' || COALESCE(shobj_description(oid, 'pg_database'), 'source unknown') FROM pg_database WHERE datname = '$BASELINE_DATABASE';"
+}
+
+setup_databases() {
+  local development_url
+  local test_url
+
+  start_postgres
+  clone_database "$DATABASE" "$BASELINE_DATABASE"
+  create_database "$TEST_DATABASE"
+  write_environment
+
+  development_url="$(database_url "$DATABASE")"
+  test_url="$(database_url "$TEST_DATABASE")"
+  run_prisma "$test_url" migrate deploy
+
+  # Keep development data identical to the selected baseline. The repository
+  # schema omits populated staging columns and narrows existing data, so db push
+  # would destructively rewrite an otherwise valid local clone.
+  run_prisma "$test_url" db push --accept-data-loss --skip-generate
+  run_prisma "$development_url" generate
+  seed_database "$test_url" test
+  sync_sequences "$DATABASE"
+  sync_sequences "$TEST_DATABASE"
+
+  printf 'Worktree database ready: %s\n' "$DATABASE"
+  printf 'Development baseline: %s\n' "$BASELINE_DATABASE"
+  printf 'Test database ready: %s\n' "$TEST_DATABASE"
+  printf 'Application port: %s\n' "$APP_PORT"
+}
+
+ensure_development_database() {
+  start_postgres
+  clone_database "$DATABASE" "$BASELINE_DATABASE"
+  sync_sequences "$DATABASE"
+  printf 'Development database ready: %s\n' "$DATABASE"
+  printf 'Development baseline: %s\n' "$BASELINE_DATABASE"
+}
+
+show_status() {
+  printf 'Development database: %s\n' "$DATABASE"
+  printf 'Test database: %s\n' "$TEST_DATABASE"
+  printf 'Development baseline: %s\n' "$BASELINE_DATABASE"
+  printf 'Application port: %s\n' "$APP_PORT"
+  printf 'Container project: %s\n' "$COMPOSE_PROJECT"
+  if compose ps --status running --quiet | grep -q .; then
+    printf 'Container status: running\n'
+  else
+    printf 'Container status: stopped\n'
+  fi
+}
+
+run_tests() {
+  local line
+  local key
+  local value
+  local test_env="$ROOT/.env.test"
+
+  [[ -f "$test_env" ]] || fail "Missing $test_env. Run 'javamifi-db setup' first."
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# || -z "$line" || "$line" != *=* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value%\"}"
+    value="${value#\"}"
+    export "$key=$value"
+  done <"$test_env"
+
+  [[ "${DATABASE_URL:-}" == *"/$TEST_DATABASE?"* ]] ||
+    fail "Refusing to run tests outside this worktree's test database: ${DATABASE_URL:-unset}"
+
+  (
+    cd "$ROOT"
+    npm test -- "$@"
+  )
+}
+
+case "${1:-status}" in
+  setup)
+    setup_databases
+    ;;
+  ensure)
+    ensure_development_database
+    ;;
+  reset)
+    start_postgres
+    drop_database "$TEST_DATABASE"
+    drop_database "$DATABASE"
+    setup_databases
+    ;;
+  drop)
+    start_postgres
+    drop_database "$TEST_DATABASE"
+    drop_database "$DATABASE"
+    ;;
+  status)
+    show_status
+    ;;
+  url)
+    database_url "$DATABASE"
+    printf '\n'
+    ;;
+  test)
+    shift
+    run_tests "$@"
+    ;;
+  baseline)
+    case "${2:-status}" in
+      set)
+        set_baseline "${3:-}"
+        ;;
+      restore)
+        restore_baseline "${3:-}" "${4:-}"
+        ;;
+      status)
+        show_baseline_status
+        ;;
+      *)
+        fail "Unknown baseline command '${2:-}'. Use baseline restore <archive.gz> <snapshot-database>, baseline set <snapshot-database>, or baseline status."
+        ;;
+    esac
+    ;;
+  *)
+    fail "Unknown command '$1'. Use setup, ensure, reset, drop, status, url, test, or baseline."
+    ;;
+esac
