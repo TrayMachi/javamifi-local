@@ -3,7 +3,11 @@ set -Eeuo pipefail
 
 readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
-readonly WORKSPACE_DIR="$(dirname -- "$SCRIPT_DIR")"
+WORKSPACE_DIR="$(dirname -- "$SCRIPT_DIR")"
+if [[ "$(basename -- "$WORKSPACE_DIR")" == "javamifi-local-worktrees" ]]; then
+  WORKSPACE_DIR="$(dirname -- "$WORKSPACE_DIR")"
+fi
+readonly WORKSPACE_DIR
 readonly COMPOSE_FILE="$SCRIPT_DIR/apps.compose.yaml"
 readonly RUNTIME_ROOT="$SCRIPT_DIR/.runtime"
 readonly FE_MAIN="$WORKSPACE_DIR/javamifi.com-fe"
@@ -24,7 +28,7 @@ require_command() {
 usage() {
   cat <<'EOF'
 Usage:
-  javamifi-localhost up [--fe PATH] [--be PATH] [--cms PATH] [--all] [--name NAME]
+  javamifi-localhost up [--fe PATH] [--be PATH] [--cms PATH] [--all] [--name NAME] [--tunnel]
   javamifi-localhost status [STACK_ID]
   javamifi-localhost logs STACK_ID [SERVICE]
   javamifi-localhost down STACK_ID
@@ -34,7 +38,7 @@ Usage:
 Run `up` inside a JavaMifi checkout to select it automatically. A frontend or
 CMS stack always includes the matching backend worktree when one exists, or the
 main backend otherwise. A backend stack includes the matching frontend or main
-frontend. Quick Tunnel URLs are temporary and change after tunnel recreation.
+frontend. Pass --tunnel only when public temporary URLs are needed.
 EOF
 }
 
@@ -143,6 +147,18 @@ pick_port() {
 compose_for() {
   local state_dir="$1"
   shift
+
+  if [[ -f "$state_dir/compose.env" ]]; then
+    if [[ -z "$(env_value "$state_dir/compose.env" FE_CACHE_PATH)" ]]; then
+      mkdir -p "$state_dir/frontend-next"
+      set_env_value "$state_dir/compose.env" FE_CACHE_PATH "$state_dir/frontend-next"
+    fi
+    if [[ -z "$(env_value "$state_dir/compose.env" CMS_CACHE_PATH)" ]]; then
+      mkdir -p "$state_dir/cms-next"
+      set_env_value "$state_dir/compose.env" CMS_CACHE_PATH "$state_dir/cms-next"
+    fi
+  fi
+
   docker compose \
     --project-name "javamifi-${STACK_ID}" \
     --file "$COMPOSE_FILE" \
@@ -173,7 +189,18 @@ wait_for_tunnel() {
 wait_for_url() {
   local url="$1"
   local origin="${2:-}"
-  local args=(--fail --silent --show-error --location --retry 45 --retry-delay 2 --retry-all-errors)
+  local args=(
+    --fail
+    --silent
+    --show-error
+    --location
+    --connect-timeout 3
+    --max-time 180
+    --retry 12
+    --retry-delay 2
+    --retry-all-errors
+    --retry-max-time 180
+  )
   if [[ -n "$origin" ]]; then
     args+=(--header "Origin: $origin")
   fi
@@ -191,6 +218,8 @@ CMS_PATH=$CMS_PATH
 BE_ENV=$state_dir/backend.env
 FE_ENV=$state_dir/frontend.env
 CMS_ENV=$state_dir/cms.env
+FE_CACHE_PATH=$state_dir/frontend-next
+CMS_CACHE_PATH=$state_dir/cms-next
 BE_PORT=$BE_PORT
 FE_PORT=$FE_PORT
 CMS_PORT=$CMS_PORT
@@ -200,6 +229,38 @@ FE_GATEWAY_CONFIG=$SCRIPT_DIR/nginx/frontend.conf
 CMS_GATEWAY_CONFIG=$SCRIPT_DIR/nginx/cms.conf
 EOF
   chmod 600 "$state_dir/compose.env"
+}
+
+write_stack_summary() {
+  local state_dir="$1"
+  local startup_status="$2"
+
+  cat >"$state_dir/summary.env" <<EOF
+STACK_ID=$STACK_ID
+STARTUP_STATUS=$startup_status
+BACKEND_PATH=$BE_PATH
+BACKEND_LOCAL=http://localhost:$BE_PORT
+FRONTEND_PATH=$([[ "$include_fe" == true ]] && printf '%s' "$FE_PATH")
+FRONTEND_URL=$frontend_url
+FRONTEND_LOCAL=$frontend_local_url
+FRONTEND_TUNNEL=$frontend_tunnel_url
+CMS_PATH=$([[ "$include_cms" == true ]] && printf '%s' "$CMS_PATH")
+CMS_URL=$cms_url
+CMS_LOCAL=$cms_local_url
+CMS_TUNNEL=$cms_tunnel_url
+EOF
+  chmod 600 "$state_dir/summary.env"
+}
+
+startup_failed() {
+  local state_dir="$1"
+  local message="$2"
+
+  set +e
+  set_env_value "$state_dir/summary.env" STARTUP_STATUS failed
+  compose_for "$state_dir" --profile fe --profile cms ps --all >&2
+  compose_for "$state_dir" --profile fe --profile cms logs --no-color --tail 100 >&2
+  fail "$message"
 }
 
 show_stack() {
@@ -252,8 +313,14 @@ show_stack_status() {
   [[ -f "$state_dir/summary.env" && -f "$state_dir/compose.env" ]] || fail "Unknown stack: $(basename "$state_dir")"
   STACK_ID="$(basename -- "$state_dir")"
   backend_url="$(env_value "$state_dir/summary.env" BACKEND_LOCAL)"
-  frontend_url="$(env_value "$state_dir/summary.env" FRONTEND_URL)"
-  cms_url="$(env_value "$state_dir/summary.env" CMS_URL)"
+  frontend_url="$(env_value "$state_dir/summary.env" FRONTEND_LOCAL)"
+  cms_url="$(env_value "$state_dir/summary.env" CMS_LOCAL)"
+  if [[ -z "$frontend_url" && -n "$(env_value "$state_dir/summary.env" FRONTEND_PATH)" ]]; then
+    frontend_url="http://localhost:$(env_value "$state_dir/compose.env" FE_GATEWAY_PORT)"
+  fi
+  if [[ -z "$cms_url" && -n "$(env_value "$state_dir/summary.env" CMS_PATH)" ]]; then
+    cms_url="http://localhost:$(env_value "$state_dir/compose.env" CMS_GATEWAY_PORT)"
+  fi
   if ! services="$(compose_for "$state_dir" --profile fe --profile cms ps --all --format '{{.Service}}|{{.State}}|{{.Health}}' 2>/dev/null)"; then
     show_stack "$state_dir"
     printf '%-18s %s\n' 'STATUS:' 'UNKNOWN'
@@ -360,6 +427,7 @@ up_stack() {
   local explicit_selection=false
   local include_fe=false
   local include_cms=false
+  local use_tunnel=false
   local current_root=""
   local current_repo=""
   local common_dir=""
@@ -374,6 +442,10 @@ up_stack() {
   local allowed_origins
   local frontend_url=""
   local cms_url=""
+  local frontend_local_url=""
+  local cms_local_url=""
+  local frontend_tunnel_url=""
+  local cms_tunnel_url=""
   local profiles=()
   local app_services=(backend)
 
@@ -416,6 +488,10 @@ up_stack() {
         [[ $# -ge 2 ]] || fail "--name requires a value."
         custom_name="$2"
         shift 2
+        ;;
+      --tunnel)
+        use_tunnel=true
+        shift
         ;;
       -h|--help)
         usage
@@ -510,6 +586,7 @@ up_stack() {
   STACK_ID="${stack_label}-${stack_hash}"
   state_dir="$RUNTIME_ROOT/$STACK_ID"
   mkdir -p "$state_dir"
+  mkdir -p "$state_dir/frontend-next" "$state_dir/cms-next"
   chmod 700 "$RUNTIME_ROOT" "$state_dir"
 
   if [[ -f "$state_dir/compose.env" ]]; then
@@ -526,6 +603,17 @@ up_stack() {
     CMS_GATEWAY_PORT="$(pick_port 35000 35999)"
   fi
 
+  if [[ "$include_fe" == true ]]; then
+    frontend_local_url="http://localhost:$FE_GATEWAY_PORT"
+  fi
+  if [[ "$include_cms" == true ]]; then
+    cms_local_url="http://localhost:$CMS_GATEWAY_PORT"
+  fi
+  frontend_url="$frontend_local_url"
+  cms_url="$cms_local_url"
+  write_compose_env "$state_dir"
+  write_stack_summary "$state_dir" starting
+
   copy_baseline_env "$BE_PATH" "$BE_MAIN" "$state_dir/backend.env"
   copy_baseline_env "$FE_PATH" "$FE_MAIN" "$state_dir/frontend.env"
   copy_baseline_env "$CMS_PATH" "$CMS_MAIN" "$state_dir/cms.env"
@@ -538,32 +626,61 @@ up_stack() {
   set_env_value "$state_dir/backend.env" NODE_ENV development
   set_env_value "$state_dir/backend.env" CLOUDFLARE_TURNSTILE_SECRET_KEY "$TURNSTILE_TEST_SECRET_KEY"
 
-  write_compose_env "$state_dir"
-
   if [[ "$include_fe" == true ]]; then
     profiles+=(--profile fe)
     app_services+=(frontend)
-    compose_for "$state_dir" --profile fe up -d gateway-fe
-    compose_for "$state_dir" --profile fe up -d --force-recreate tunnel-fe
+    if ! compose_for "$state_dir" --profile fe up -d gateway-fe; then
+      startup_failed "$state_dir" "Frontend gateway did not start."
+    fi
+    if [[ "$use_tunnel" == true ]]; then
+      if ! compose_for "$state_dir" --profile fe up -d --force-recreate tunnel-fe; then
+        startup_failed "$state_dir" "Frontend Quick Tunnel did not start."
+      fi
+    else
+      if ! compose_for "$state_dir" --profile fe stop tunnel-fe >/dev/null; then
+        startup_failed "$state_dir" "Frontend Quick Tunnel did not stop."
+      fi
+    fi
   fi
   if [[ "$include_cms" == true ]]; then
     profiles+=(--profile cms)
     app_services+=(cms)
-    compose_for "$state_dir" --profile cms up -d gateway-cms
-    compose_for "$state_dir" --profile cms up -d --force-recreate tunnel-cms
+    if ! compose_for "$state_dir" --profile cms up -d gateway-cms; then
+      startup_failed "$state_dir" "CMS gateway did not start."
+    fi
+    if [[ "$use_tunnel" == true ]]; then
+      if ! compose_for "$state_dir" --profile cms up -d --force-recreate tunnel-cms; then
+        startup_failed "$state_dir" "CMS Quick Tunnel did not start."
+      fi
+    else
+      if ! compose_for "$state_dir" --profile cms stop tunnel-cms >/dev/null; then
+        startup_failed "$state_dir" "CMS Quick Tunnel did not stop."
+      fi
+    fi
   fi
 
   if [[ "$include_fe" == true ]]; then
-    frontend_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"
+    if [[ "$use_tunnel" == true ]]; then
+      if ! frontend_tunnel_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"; then
+        startup_failed "$state_dir" "Frontend Quick Tunnel did not become ready."
+      fi
+      frontend_url="$frontend_tunnel_url"
+    fi
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_API_URL "$frontend_url/api/v1"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_SITE_URL "$frontend_url"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITE_KEY "$TURNSTILE_TEST_SITE_KEY"
   fi
   if [[ "$include_cms" == true ]]; then
-    cms_url="$(wait_for_tunnel "$state_dir" tunnel-cms)"
+    if [[ "$use_tunnel" == true ]]; then
+      if ! cms_tunnel_url="$(wait_for_tunnel "$state_dir" tunnel-cms)"; then
+        startup_failed "$state_dir" "CMS Quick Tunnel did not become ready."
+      fi
+      cms_url="$cms_tunnel_url"
+    fi
     set_env_value "$state_dir/cms.env" NEXT_PUBLIC_API_BASE_URL "$cms_url/api/v1"
     set_env_value "$state_dir/cms.env" NEXT_PUBLIC_ENV development
   fi
+  write_stack_summary "$state_dir" starting
 
   original_origins="$(env_value "$state_dir/backend.env" ALLOWED_ORIGINS)"
   original_origins="${original_origins%\"}"
@@ -578,31 +695,29 @@ up_stack() {
     set_env_value "$state_dir/backend.env" FRONTEND_URL "$frontend_url"
   fi
 
-  compose_for "$state_dir" "${profiles[@]}" up -d --force-recreate --wait "${app_services[@]}"
+  if ! compose_for "$state_dir" "${profiles[@]}" up -d --force-recreate --wait "${app_services[@]}"; then
+    startup_failed "$state_dir" "Application containers did not become ready."
+  fi
 
   if [[ "$include_fe" == true ]]; then
-    wait_for_url "$frontend_url/api/v1/health" "$frontend_url"
-    wait_for_url "$frontend_url"
+    if ! wait_for_url "$frontend_local_url/api/v1/health" "$frontend_local_url" ||
+      ! wait_for_url "$frontend_local_url" "$frontend_local_url"; then
+      startup_failed "$state_dir" "Frontend did not respond at $frontend_local_url."
+    fi
   fi
   if [[ "$include_cms" == true ]]; then
-    wait_for_url "$cms_url/api/v1/health" "$cms_url"
-    wait_for_url "$cms_url"
+    if ! wait_for_url "$cms_local_url/api/v1/health" "$cms_local_url" ||
+      ! wait_for_url "$cms_local_url" "$cms_local_url"; then
+      startup_failed "$state_dir" "CMS did not respond at $cms_local_url."
+    fi
   fi
-
-  cat >"$state_dir/summary.env" <<EOF
-STACK_ID=$STACK_ID
-BACKEND_PATH=$BE_PATH
-BACKEND_LOCAL=http://localhost:$BE_PORT
-FRONTEND_PATH=$([[ "$include_fe" == true ]] && printf '%s' "$FE_PATH")
-FRONTEND_URL=$frontend_url
-CMS_PATH=$([[ "$include_cms" == true ]] && printf '%s' "$CMS_PATH")
-CMS_URL=$cms_url
-EOF
-  chmod 600 "$state_dir/summary.env"
+  write_stack_summary "$state_dir" ready
 
   printf '\nJavaMifi localhost stack is ready.\n'
   show_stack "$state_dir"
-  printf 'Quick Tunnel URLs are public, temporary, and intended only for development.\n'
+  if [[ "$use_tunnel" == true ]]; then
+    printf 'Quick Tunnel URLs are public, temporary, and intended only for development.\n'
+  fi
 }
 
 command="${1:-up}"

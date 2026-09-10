@@ -70,7 +70,7 @@ javamifi-localhost up --all --name main
 ```
 
 The command starts Docker containers, prepares the backend database, and
-prints the frontend and CMS URLs. Open the URL you need in your browser.
+prints the local frontend and CMS URLs. Open the URL you need in your browser.
 
 The first start may take a while because npm dependencies and Docker images
 may need to be downloaded.
@@ -109,10 +109,10 @@ treated as proof that the stack is available.
 
 Stopping an application stack removes its containers, network, and
 project-scoped volumes but does not delete its database or generated runtime
-state. Starting the same stack again reuses its local ports, but creates new
-temporary Quick Tunnel URLs. Always use the URLs printed by the latest `up`
-command. Use `cleanup --path` after merging a worktree to remove its runtime
-state as well.
+state. Starting the same stack again reuses its local ports. Use `--tunnel`
+when you need new temporary Quick Tunnel URLs, and always use the URLs printed
+by the latest `up` command. Use `cleanup --path` after merging a worktree to
+remove its runtime state as well.
 
 ## Run a worktree
 
@@ -137,6 +137,18 @@ javamifi-localhost up \
 When you run `javamifi-localhost up` inside a JavaMifi checkout, it usually
 selects that checkout automatically and finds a matching backend or frontend
 worktree when one exists.
+
+## Public Quick Tunnels
+
+Local stacks do not expose public URLs by default. Add `--tunnel` only when a
+teammate or external service needs to reach your stack:
+
+```bash
+javamifi-localhost up --all --name main --tunnel
+```
+
+Quick Tunnel URLs are temporary and change whenever their containers are
+recreated. Local URLs remain available and are used for health checks.
 
 ## Database commands
 
@@ -177,7 +189,8 @@ command removes the shared PostgreSQL container, volume, or immutable baseline.
 
 ## Important notes
 
-- Quick Tunnel URLs are public, temporary, and for development only.
+- Quick Tunnel URLs created with `--tunnel` are public, temporary, and for
+  development only.
 - Do not use production Turnstile credentials with local Quick Tunnels. The
   local stack supplies Cloudflare's test credentials automatically.
 - Do not connect application code to `javamifi_worktree_baseline`. It is the
@@ -207,8 +220,16 @@ javamifi-db baseline restore /path/to/snapshot.gz javamifi_staging_YYYYMMDD
 
 ### A Quick Tunnel URL does not work
 
-Run `javamifi-localhost up` again and use the new URL. Quick Tunnels have no
-uptime guarantee.
+Run `javamifi-localhost up --tunnel` again and use the new URL. Quick Tunnels
+have no uptime guarantee.
+
+### The frontend remains on Compiling
+
+Each stack stores its Turbopack cache in its runtime directory so concurrent
+worktrees do not share `.next`. Inspect the frontend logs first. If its cache
+is stale, stop the stack, remove only that stack's `frontend-next` runtime
+directory, and start it again. Set `NEXT_TURBOPACK_TRACING=1` in the frontend
+environment when a reproducible hang needs a `.next/dev/trace-turbopack` trace.
 
 ### The backend is unhealthy
 
