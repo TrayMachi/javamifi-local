@@ -571,6 +571,8 @@ up_stack() {
   allowed_origins="$original_origins"
   [[ -n "$frontend_url" ]] && allowed_origins="${allowed_origins:+$allowed_origins,}$frontend_url"
   [[ -n "$cms_url" ]] && allowed_origins="${allowed_origins:+$allowed_origins,}$cms_url"
+  [[ "$include_fe" == true ]] && allowed_origins="${allowed_origins:+$allowed_origins,}http://localhost:$FE_GATEWAY_PORT"
+  [[ "$include_cms" == true ]] && allowed_origins="${allowed_origins:+$allowed_origins,}http://localhost:$CMS_GATEWAY_PORT"
   set_env_value "$state_dir/backend.env" ALLOWED_ORIGINS "$allowed_origins"
   if [[ -n "$frontend_url" ]]; then
     set_env_value "$state_dir/backend.env" FRONTEND_URL "$frontend_url"
