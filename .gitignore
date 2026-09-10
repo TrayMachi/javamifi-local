@@ -1,3 +1,4 @@
 .runtime/
+.playwright-cli/
 *.gz
 postgres-data-staging/
