@@ -40,6 +40,7 @@ services:
       HOME: /tmp
     volumes:
       - ${FE_PATH}:${FE_PATH}
+      - ${FE_CACHE_PATH}:${FE_PATH}/.next
     ports:
       - "127.0.0.1:${FE_PORT}:3000"
     healthcheck:
@@ -47,7 +48,7 @@ services:
         - CMD
         - node
         - -e
-        - fetch('http://127.0.0.1:3000').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+        - require('node:net').connect(3000,'127.0.0.1').once('connect',()=>process.exit(0)).once('error',()=>process.exit(1))
       interval: 2s
       timeout: 5s
       retries: 90
@@ -66,6 +67,7 @@ services:
       HOME: /tmp
     volumes:
       - ${CMS_PATH}:${CMS_PATH}
+      - ${CMS_CACHE_PATH}:${CMS_PATH}/.next
     ports:
       - "127.0.0.1:${CMS_PORT}:3002"
     healthcheck:
@@ -73,7 +75,7 @@ services:
         - CMD
         - node
         - -e
-        - fetch('http://127.0.0.1:3002').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+        - require('node:net').connect(3002,'127.0.0.1').once('connect',()=>process.exit(0)).once('error',()=>process.exit(1))
       interval: 2s
       timeout: 5s
       retries: 90
