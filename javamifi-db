@@ -242,6 +242,10 @@ set_baseline() {
   database_exists "$source" || fail "Source database '$source' does not exist."
 
   if database_exists "$BASELINE_DATABASE"; then
+    compose exec -T postgres psql \
+      --username "$DB_USER" \
+      --dbname postgres \
+      --command "ALTER DATABASE $BASELINE_DATABASE WITH IS_TEMPLATE false;"
     drop_database "$BASELINE_DATABASE"
   fi
 
