@@ -438,6 +438,7 @@ up_stack() {
   local stack_label
   local state_dir
   local database_url
+  local openai_api_key
   local original_origins
   local allowed_origins
   local frontend_url=""
@@ -618,6 +619,11 @@ up_stack() {
   copy_baseline_env "$FE_PATH" "$FE_MAIN" "$state_dir/frontend.env"
   copy_baseline_env "$CMS_PATH" "$CMS_MAIN" "$state_dir/cms.env"
 
+  openai_api_key="$(env_value "$state_dir/backend.env" OPENAI_API_KEY)"
+  if [[ "$openai_api_key" == \"*\" && "$openai_api_key" == *\" ]]; then
+    set_env_value "$state_dir/backend.env" OPENAI_API_KEY "${openai_api_key:1:-1}"
+  fi
+
   database_url="$(cd "$BE_PATH" && "$SCRIPT_DIR/javamifi-db" url)"
   database_url="${database_url/@127.0.0.1:5432/@postgres:5432}"
   database_url="${database_url/@localhost:5432/@postgres:5432}"
@@ -660,12 +666,8 @@ up_stack() {
   fi
 
   if [[ "$include_fe" == true ]]; then
-    if [[ "$use_tunnel" == true ]]; then
-      if ! frontend_tunnel_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"; then
-        startup_failed "$state_dir" "Frontend Quick Tunnel did not become ready."
-      fi
-      frontend_url="$frontend_tunnel_url"
-    fi
+    frontend_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"
+    set_env_value "$state_dir/frontend.env" INTERNAL_API_URL "http://backend:3001/api/v1"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_API_URL "$frontend_url/api/v1"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_SITE_URL "$frontend_url"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITE_KEY "$TURNSTILE_TEST_SITE_KEY"
