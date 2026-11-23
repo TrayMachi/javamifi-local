@@ -666,7 +666,9 @@ up_stack() {
   fi
 
   if [[ "$include_fe" == true ]]; then
-    frontend_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"
+    if [[ "$use_tunnel" == true ]]; then
+      frontend_url="$(wait_for_tunnel "$state_dir" tunnel-fe)"
+    fi
     set_env_value "$state_dir/frontend.env" INTERNAL_API_URL "http://backend:3001/api/v1"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_API_URL "$frontend_url/api/v1"
     set_env_value "$state_dir/frontend.env" NEXT_PUBLIC_SITE_URL "$frontend_url"
